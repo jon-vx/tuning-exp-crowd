@@ -1,0 +1,253 @@
+<!doctype html>
+<html lang="en">
+
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Runtime orchestration experiment</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+      background: #111;
+      color: #eee;
+    }
+
+    body {
+      margin: 0;
+    }
+
+    main {
+      width: min(600px, calc(100% - 32px));
+      margin: 32px auto;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      font-size: 20px;
+    }
+
+    p {
+      margin: 8px 0;
+      color: #aaa;
+      font: 13px/1.5 system-ui, sans-serif;
+    }
+
+    button {
+      padding: 10px 16px;
+      border: 1px solid #777;
+      border-radius: 2px;
+      background: #eee;
+      color: #111;
+      font: inherit;
+      cursor: pointer;
+    }
+
+    button:disabled {
+      opacity: .5;
+      cursor: default;
+    }
+
+    ol {
+      padding-left: 28px;
+    }
+
+    li {
+      margin: 10px 0;
+      font-size: 13px;
+      line-height: 1.5;
+    }
+
+    pre {
+      padding: 12px;
+      border: 1px solid #444;
+      white-space: pre-wrap;
+      font: 13px/1.5 inherit;
+    }
+
+    .error {
+      color: #ff8a8a;
+    }
+  </style>
+</head>
+
+<body>
+  <main>
+    <h1>Runtime orchestration experiment</h1>
+    <p>Three baseline and three tuned runs in random order. No warmup.</p>
+    <button id="go">Go</button>
+    <p id="status"></p>
+    <ol id="results"></ol>
+    <pre id="summary" hidden></pre>
+  </main>
+
+  <script type="module">
+    import {CreateMLCEngine} from "./webllm-patched.js";
+
+    const RESULTS_URL = "https://runtime-orch-results.runtime-orch-cs.workers.dev/results";
+
+    const MODEL = "SmolLM2-360M-Instruct-q4f16_1-MLC";
+    const PROMPT = "Explain why the Moon has phases in one sentence.";
+    const MAX_TOKENS = 48;
+
+    const POLICIES = {
+      baseline: {dispatchesPerEncoder: 1, reuseUniformBuffers: false},
+      tuned: {dispatchesPerEncoder: 16, reuseUniformBuffers: true},
+    };
+
+    const go = document.querySelector("#go");
+    const status = document.querySelector("#status");
+    const resultsList = document.querySelector("#results");
+    const summary = document.querySelec / tor("#summary");
+
+    function shuffle(values) {
+      const result = [...values];
+      for (let i = result.length - 1; i > 0; i--) {
+        const j = Math.floor(Math.random() * (i + 1));
+        [result[i], result[j]] = [result[j], result[i]];
+      }
+      return result;
+    }
+
+    function mean(values) {
+      return values.reduce((total, value) => total + value, 0) / values.length;
+    }
+
+    function showRun(run) {
+      const item = document.createElement("li");
+      item.textContent = `${run.condition}: ${run.timeMs.toFixed(1)} ms — Response: ${run.response}`;
+      resultsList.append(item);
+    }
+
+    async function getSystemInfo(runtime) {
+      let ua = {};
+      try {
+        ua = await navigator.userAgentData?.getHighEntropyValues([
+          "architecture",
+          "bitness",
+          "model",
+          "platformVersion",
+          "fullVersionList",
+        ]) || {};
+      } catch {
+      }
+
+      const gpu = runtime.getDeviceInfo?.() || {};
+      return {
+        gpuVendor: gpu.vendor || "",
+        gpuArchitecture: gpu.architecture || "",
+        gpuDevice: gpu.device || "",
+        gpuDescription: gpu.description || "",
+        gpuIsFallback: gpu.isFallbackAdapter ?? null,
+        gpuSubgroupMinSize: gpu.subgroupMinSize ?? null,
+        gpuSubgroupMaxSize: gpu.subgroupMaxSize ?? null,
+        cpuArchitecture: ua.architecture || "",
+        cpuBitness: ua.bitness || "",
+        deviceModel: ua.model || "",
+        platformVersion: ua.platformVersion || "",
+        browserBrands: JSON.stringify(ua.fullVersionList || navigator.userAgentData?.brands || []),
+      };
+    }
+
+    async function saveResults(payload) {
+      const response = await fetch(RESULTS_URL, {
+        method: "POST",
+        headers: {"Content-Type": "application/json"},
+        body: JSON.stringify(payload),
+      });
+
+      if (!response.ok) throw new Error(`Saving results returned HTTP ${response.status}.`);
+    }
+
+    go.addEventListener("click", async () => {
+      go.disabled = true;
+      status.className = "";
+      status.textContent = "Loading model…";
+      resultsList.replaceChildren();
+      summary.hidden = true;
+
+      let engine;
+      try {
+        engine = await CreateMLCEngine(MODEL);
+        const runtime = globalThis.__WEBLLM_ORCHESTRATION_EXPERIMENT__;
+        if (!runtime?.setPolicy) throw new Error("The patched WebLLM runtime was not found.");
+
+        const systemInfo = await getSystemInfo(runtime);
+        const order = shuffle(["baseline", "baseline", "baseline", "tuned", "tuned", "tuned"]);
+        const runs = [];
+
+        console.log("Run order:", order);
+
+        for (let i = 0; i < order.length; i++) {
+          const condition = order[i];
+          status.textContent = `Running ${i + 1} of 6…`;
+
+          await runtime.setPolicy(POLICIES[condition]);
+          await engine.resetChat();
+
+          const started = performance.now();
+          const completion = await engine.chat.completions.create({
+            messages: [{role: "user", content: PROMPT}],
+            max_tokens: MAX_TOKENS,
+            temperature: 0,
+          });
+          const timeMs = performance.now() - started;
+          const response = completion.choices[0].message.content.trim();
+          const run = {run: i + 1, condition, timeMs, response};
+
+          runs.push(run);
+          showRun(run);
+          console.log(`Run ${run.run}/6 | ${condition} | ${timeMs.toFixed(1)} ms | Response: ${response}`);
+        }
+
+        const baselineMeanMs = mean(runs.filter(run => run.condition === "baseline").map(run => run.timeMs));
+        const tunedMeanMs = mean(runs.filter(run => run.condition === "tuned").map(run => run.timeMs));
+        const improvementPercent = ((baselineMeanMs - tunedMeanMs) / baselineMeanMs) * 100;
+        const individualRuns = Object.fromEntries(runs.flatMap((run, index) => [
+          [`run${index + 1}Condition`, run.condition],
+          [`run${index + 1}TimeMs`, run.timeMs],
+        ]));
+        const payload = {
+          schemaVersion: 1,
+          sessionId: crypto.randomUUID(),
+          createdAt: new Date().toISOString(),
+          model: MODEL,
+          prompt: PROMPT,
+          maxTokens: MAX_TOKENS,
+          userAgent: navigator.userAgent,
+          platform: navigator.userAgentData?.platform || navigator.platform,
+          hardwareConcurrency: navigator.hardwareConcurrency ?? null,
+          deviceMemoryGB: navigator.deviceMemory ?? null,
+          ...systemInfo,
+          runOrder: order,
+          runs,
+          ...individualRuns,
+          baselineMeanMs,
+          tunedMeanMs,
+          improvementPercent,
+          sameResponse: new Set(runs.map(run => run.response)).size === 1,
+        };
+
+        await saveResults(payload);
+        summary.textContent = [
+          `Baseline mean: ${baselineMeanMs.toFixed(1)} ms`,
+          `Tuned mean: ${tunedMeanMs.toFixed(1)} ms`,
+          `Improvement: ${improvementPercent.toFixed(1)}%`,
+          "Results saved.",
+        ].join("\n");
+        summary.hidden = false;
+        status.textContent = "Done.";
+        console.log("Experiment result:", payload);
+      } catch (error) {
+        console.error(error);
+        status.className = "error";
+        status.textContent = `Error: ${error.message}`;
+      } finally {
+        if (engine) await engine.unload();
+        go.disabled = false;
+      }
+    });
+  </script>
+</body>
+
+</html>

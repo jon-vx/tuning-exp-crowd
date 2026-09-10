@@ -1,0 +1,19 @@
+{
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "runtime-orch-results",
+  "main": "index.js",
+  "compatibility_date": "2026-08-28",
+  "vars": {
+    "ALLOWED_ORIGINS": "https://jon-vx.github.io,http://localhost:8010,http://127.0.0.1:8010"
+  },
+  "ratelimits": [
+    {
+      "name": "SUBMISSIONS",
+      "namespace_id": "1001",
+      "simple": {
+        "limit": 3,
+        "period": 60
+      }
+    }
+  ]
+}
